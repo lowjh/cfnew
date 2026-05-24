@@ -1,0 +1,55 @@
+name: Auto Deploy CFnew
+
+on:
+  schedule:
+    - cron: '0 16 * * *'  # UTC 16:00 = Beijing 00:00 (daily)
+  workflow_dispatch:
+
+jobs:
+  auto-deploy:
+    runs-on: ubuntu-latest
+    if: github.repository == 'lowjh/cfnew'
+    steps:
+      - name: Fetch latest obfuscated code from upstream
+        id: fetch
+        continue-on-error: true
+        run: |
+          echo "Fetched byJoey/cfnew main branch..."
+          curl -L https://raw.githubusercontent.com/byJoey/cfnew/main/%E5%B0%91%E5%B9%B4%E4%BD%A0%E7%9B%B8%E4%BF%A1%E5%85%89%E5%90%97 -o worker.js || { echo "Failed to download."; exit 1; }
+          if [ ! -s worker.js ]; then
+            echo "Download failed or empty."
+            exit 1
+          fi
+          echo "✅ Fetched $(wc -c < worker.js) bytes"
+
+      - name: Check for changes
+        id: check
+        run: |
+          CURRENT_HASH=$(md5sum worker.js | awk '{print $1}')
+          PREV_HASH=$(cat .last-hash 2>/dev/null || echo "")
+          
+          if [ "$CURRENT_HASH" != "$PREV_HASH" ]; then
+            echo "HAS_CHANGE=true" >> $GITHUB_OUTPUT
+            echo "🔄 Code updated (hash: ${CURRENT_HASH::8})"
+          else
+            echo "No change detected, skipping deployment."
+          fi
+
+      - name: Upload to Cloudflare Worker via REST API
+        if: steps.check.outputs.HAS_CHANGE == 'true'
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          WORKER_NAME: louwhnew
+        run: |
+          RESPONSE=$(curl -sS -w "\nHTTP_CODE:%{http_code}"             -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/workers/scripts/$WORKER_NAME/content"             -H "Authorization: Bearer $CF_API_TOKEN"             -F "code=@worker.js")
+            
+          HTTP_STATUS=$(echo "$RESPONSE" | grep HTTP_CODE | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | sed '/^HTTP_CODE/d')
+          
+          echo "Cloudflare Response:"
+          echo "$BODY"
+
+      - name: Save hash for next comparison
+        if: success() && steps.check.outputs.HAS_CHANGE == 'true'
+        run: md5sum worker.js | awk '{print $1}' > .last-hash
