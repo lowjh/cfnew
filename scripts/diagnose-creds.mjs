@@ -1,13 +1,12 @@
 #!/usr/bin/env node
 /**
- * Cloudflare 凭据深度诊断（只读，不部署）
+ * Cloudflare 凭据深度诊断 v3（只读，不部署）
  *
- * 目标：区分三种情形
- *   A. token 完全无效
- *   B. token 有效，但缺某些端点的权限（属于不同账号 / 缺 Account Settings Read）
- *   C. token 与 CF_ACCOUNT_ID 不属于同一账号
- *
- * 打印 token 的前缀特征（只露前 6 后 4 位），用于判断 token 类型。
+ * 背景：CF_API_TOKEN 是 account-owned token（cfat_ 前缀），
+ * 它不是 user token，因此：
+ *   - /user/tokens/verify  -> 401/1000 是正常的（该端点只认用户令牌）
+ *   - /accounts、/zones    -> 403/9109 是正常的（账户令牌无用户作用域）
+ * 账户令牌的正确验证端点是 /accounts/{account_id}/tokens/verify
  */
 
 const CF_API = 'https://api.cloudflare.com/client/v4';
@@ -15,26 +14,10 @@ const token = (process.env.CF_API_TOKEN || '').trim();
 const accountId = (process.env.CF_ACCOUNT_ID || '').trim();
 const project = process.env.PAGES_PROJECT || 'cfnewup-dic';
 
-function tokenSignature(v) {
-  if (!v) return '(空)';
-  const head = v.slice(0, 6);
-  const tail = v.slice(-4);
-  const charset = {
-    有连字符: v.includes('-'),
-    有下划线: v.includes('_'),
-    有点: v.includes('.'),
-    有冒号: v.includes(':'),
-    有空格: v.includes(' '),
-    纯数字: /^[0-9]+$/.test(v),
-    base62: /^[A-Za-z0-9]+$/.test(v),
-    看起来像JWT: v.split('.').length === 3,
-  };
-  const marks = Object.entries(charset)
-    .filter(([, yes]) => yes)
-    .map(([k]) => k)
-    .join(', ');
-  return `前6=${head}… 后4=…${tail}  特征: ${marks || '(无特殊字符)'}`;
-}
+// 已知的老大账号（来自 Cloudflare 控制台 / 上次手工验证记录）
+const KNOWN_ACCOUNT = 'fa16b37ea19c5c91ac0565f658fdadd8';
+
+const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 
 async function probe(label, url, headers) {
   let status = 0;
@@ -49,8 +32,7 @@ async function probe(label, url, headers) {
       body = j.errors.map((e) => `[${e.code}] ${e.message}`).join(' || ');
     } else if (j && j.success === true) {
       const r = j.result;
-      if (Array.isArray(r)) body = `成功，${r.length} 项` + (r.length ? ' → ' + r.slice(0, 5).map((x) => x.name || x.id).join(', ') : '');
-      else body = '成功 → ' + JSON.stringify(r).slice(0, 300);
+      body = '成功 → ' + JSON.stringify(r).slice(0, 400);
     } else {
       body = text.slice(0, 300).replace(/\s+/g, ' ');
     }
@@ -61,27 +43,45 @@ async function probe(label, url, headers) {
   return { status, body };
 }
 
-const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
-
 async function main() {
-  console.log('===== 1. 凭据形态 =====');
-  console.log('CF_API_TOKEN: ' + tokenSignature(token));
-  console.log('CF_ACCOUNT_ID: 长度=' + accountId.length + ' 十六进制=' + /^[0-9a-f]{32}$/i.test(accountId));
+  console.log('===== 凭据形态 =====');
+  console.log('CF_API_TOKEN 前6 = ' + token.slice(0, 6) + '…  长度=' + token.length);
+  console.log('CF_ACCOUNT_ID   = ' + accountId);
+  console.log('已知账号ID      = ' + KNOWN_ACCOUNT);
+  console.log('两者是否一致    = ' + (accountId === KNOWN_ACCOUNT));
   console.log('');
 
-  console.log('===== 2. 逐端点探测（Bearer）=====');
-  await probe('GET /user/tokens/verify', `${CF_API}/user/tokens/verify`, auth);
-  await probe('GET /accounts', `${CF_API}/accounts`, auth);
-  await probe('GET /accounts/{id}', `${CF_API}/accounts/${accountId}`, auth);
-  await probe(`GET /accounts/{id}/pages/projects/${project}`, `${CF_API}/accounts/${accountId}/pages/projects/${project}`, auth);
-  await probe(`GET /accounts/{id}/pages/projects (列表)`, `${CF_API}/accounts/${accountId}/pages/projects`, auth);
-  await probe('GET /zones', `${CF_API}/zones`, auth);
+  console.log('===== 用正确的 account-token 端点验证 =====');
+  await probe(
+    `GET /accounts/${accountId}/tokens/verify`,
+    `${CF_API}/accounts/${accountId}/tokens/verify`,
+    auth
+  );
+  if (accountId !== KNOWN_ACCOUNT) {
+    await probe(
+      `GET /accounts/{已知ID}/tokens/verify`,
+      `${CF_API}/accounts/${KNOWN_ACCOUNT}/tokens/verify`,
+      auth
+    );
+  }
 
-  console.log('\n===== 3. 结论判定 =====');
-  console.log('  /user/tokens/verify 401/1000  → token 已被 Cloudflare 判定无效（换 token 或改用 Global Key）');
-  console.log('  /user/tokens/verify 200       → token 本身有效，后续 403 是端点权限或账号不匹配');
-  console.log('  /accounts 403/9109            → 缺 Account Settings Read，wrangler 因先查 /accounts 而失败');
-  console.log('  /accounts/{id}/pages/... 成功  → 权限与账号都对，问题只在 wrangler 的调用顺序');
+  console.log('\n===== 目标资源可达性 =====');
+  await probe(
+    `GET /accounts/${accountId}/pages/projects/${project}`,
+    `${CF_API}/accounts/${accountId}/pages/projects/${project}`,
+    auth
+  );
+  await probe(
+    `GET /accounts/${accountId}/pages/projects`,
+    `${CF_API}/accounts/${accountId}/pages/projects`,
+    auth
+  );
+
+  console.log('\n===== 结论 =====');
+  console.log('  /accounts/{id}/tokens/verify 200 → 令牌有效且属于该 account');
+  console.log('  1001 Missing Authorization        → 请求没带上头（诊断脚本 bug）');
+  console.log('  10000 Authentication error       → account id 与令牌所属账号不符');
+  console.log('  9109 Invalid access token       → 令牌无效/已吊销，或账户作用域端点不接受');
   console.log('诊断结束。');
 }
 
