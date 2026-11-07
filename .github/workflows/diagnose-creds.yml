@@ -13,6 +13,9 @@ jobs:
   diagnose:
     runs-on: ubuntu-latest
     steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
       - name: 诊断 Cloudflare 凭据
         env:
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
