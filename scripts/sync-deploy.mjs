@@ -122,27 +122,39 @@ function buildPagesDir(workerBuf) {
   const fs = require('fs');
   const os = require('os');
   const path = require('path');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfnew-deploy-'));
-  fs.writeFileSync(path.join(dir, '_worker.js'), workerBuf);
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cfnew-deploy-'));
+  // 产物放在 out/ 目录，wrangler.toml 声明 pages_build_output_dir
+  const out = path.join(root, 'out');
+  fs.mkdirSync(out);
+  fs.writeFileSync(path.join(out, '_worker.js'), workerBuf);
   fs.writeFileSync(
-    path.join(dir, 'wrangler.toml'),
-    'name = "' + PAGES_PROJECT + '"\ncompatibility_date = "2026-01-20"\n'
+    path.join(root, 'wrangler.toml'),
+    [
+      `name = "${PAGES_PROJECT}"`,
+      'compatibility_date = "2026-01-20"',
+      'pages_build_output_dir = "out"',
+      '',
+    ].join('\n')
   );
-  return dir;
+  return root;
 }
 
 /**
  * 用 wrangler 部署到 Pages。
  * wrangler 会自动生成正确的 assets manifest，且同时支持
  * CLOUDFLARE_API_TOKEN 与 CLOUDFLARE_API_KEY + CLOUDFLARE_EMAIL 两种凭据。
+ *
+ * 注意：必须在临时目录内运行 —— 仓库根目录已有自己的 wrangler.toml，
+ * 在那里跑会被 wrangler 抢先读取，导致 Pages 部署报错。
  */
 async function deployToPages(dir) {
   const { execFileSync } = require('child_process');
   const args = [
+    '-y',
     'wrangler@4',
     'pages',
     'deploy',
-    dir,
+    'out',
     '--project-name',
     PAGES_PROJECT,
     '--branch',
@@ -151,26 +163,39 @@ async function deployToPages(dir) {
     '--commit-message',
     `sync from ${UPSTREAM_REPO}@${UPSTREAM_BRANCH}`,
   ];
+
+  const env = {
+    ...process.env,
+    CLOUDFLARE_ACCOUNT_ID: CF_ACCOUNT_ID,
+    CLOUDFLARE_API_TOKEN: process.env.CF_API_TOKEN || '',
+    CLOUDFLARE_API_KEY: process.env.CF_API_KEY || '',
+    CLOUDFLARE_EMAIL: process.env.CF_EMAIL || '',
+  };
+  // 显式清空 wrangler 的登录态文件，避免干扰
+  env.WRANGLER_HOME = dir;
+
   let stdout = '';
   try {
-    stdout = execFileSync('npx', ['-y', ...args], {
+    stdout = execFileSync('npx', args, {
       encoding: 'utf8',
+      cwd: dir,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        CLOUDFLARE_ACCOUNT_ID: CF_ACCOUNT_ID,
-        CLOUDFLARE_API_TOKEN: process.env.CF_API_TOKEN || '',
-        CLOUDFLARE_API_KEY: process.env.CF_API_KEY || '',
-        CLOUDFLARE_EMAIL: process.env.CF_EMAIL || '',
-      },
+      env,
     });
     log(stdout);
   } catch (e) {
+    const err = String(e.stderr || '') + String(e.stdout || '');
     console.error('::error::wrangler 部署失败');
-    console.error('--- stdout ---');
-    console.error(String(e.stdout || '').slice(-3000));
+    if (err.includes('9109') || err.includes('Invalid access token')) {
+      console.error('::error::CF_API_TOKEN 无效或已过期（code 9109）。需要在 Cloudflare 后台重新创建 API Token，');
+      console.error('::error::并更新仓库 Secret。所需权限：Account > Cloudflare Pages > Edit、Account Settings > Read。');
+    } else if (err.includes('10000') || err.includes('Authentication error')) {
+      console.error('::error::Cloudflare 认证失败（code 10000）。请检查 CF_ACCOUNT_ID 与 token 是否属于同一账号。');
+    }
     console.error('--- stderr ---');
     console.error(String(e.stderr || '').slice(-3000));
+    console.error('--- stdout ---');
+    console.error(String(e.stdout || '').slice(-2000));
     process.exit(1);
   }
   // 校验输出里有成功部署的 URL，没有就是失败
