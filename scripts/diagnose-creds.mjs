@@ -1,114 +1,91 @@
 #!/usr/bin/env node
 /**
- * Cloudflare 凭据诊断脚本 —— 只读探测，不部署、不修改任何东西。
+ * Cloudflare 凭据深度诊断（只读，不部署）
  *
- * 目的：搞清楚 secrets.CF_API_TOKEN 到底是什么形态，导致 wrangler 报
- *   [code: 9109] Invalid access token
- *   [code: 10000] Authentication error
+ * 目标：区分三种情形
+ *   A. token 完全无效
+ *   B. token 有效，但缺某些端点的权限（属于不同账号 / 缺 Account Settings Read）
+ *   C. token 与 CF_ACCOUNT_ID 不属于同一账号
  *
- * 打印内容全部是「形状信息」（长度 / 是否十六进制 / 是否含空白），
- * 绝不打印凭据本身。
+ * 打印 token 的前缀特征（只露前 6 后 4 位），用于判断 token 类型。
  */
 
 const CF_API = 'https://api.cloudflare.com/client/v4';
+const token = (process.env.CF_API_TOKEN || '').trim();
+const accountId = (process.env.CF_ACCOUNT_ID || '').trim();
+const project = process.env.PAGES_PROJECT || 'cfnewup-dic';
 
-const token = process.env.CF_API_TOKEN || '';
-const apiKey = process.env.CF_API_KEY || '';
-const email = process.env.CF_EMAIL || '';
-const accountId = process.env.CF_ACCOUNT_ID || '';
-
-function shape(label, v) {
-  if (!v) {
-    console.log(`${label}: (空)`);
-    return;
-  }
-  const trimmed = v.trim();
-  console.log(`${label}:`);
-  console.log(`  原始长度          = ${v.length}`);
-  console.log(`  trim 后长度       = ${trimmed.length}`);
-  console.log(`  长度是否相等      = ${v.length === trimmed.length}  (不等说明首尾有空白/换行)`);
-  console.log(`  含空白字符        = ${/\s/.test(v)}`);
-  console.log(`  全部十六进制      = ${/^[0-9a-fA-F]+$/.test(trimmed)}`);
-  console.log(`  形如 Global Key   = ${/^[0-9a-fA-F]{37}$/.test(trimmed)}  (37位十六进制 = Global API Key)`);
-  console.log(`  形如 API Token    = ${trimmed.length >= 40 && !/^[0-9a-fA-F]+$/.test(trimmed)}`);
+function tokenSignature(v) {
+  if (!v) return '(空)';
+  const head = v.slice(0, 6);
+  const tail = v.slice(-4);
+  const charset = {
+    有连字符: v.includes('-'),
+    有下划线: v.includes('_'),
+    有点: v.includes('.'),
+    有冒号: v.includes(':'),
+    有空格: v.includes(' '),
+    纯数字: /^[0-9]+$/.test(v),
+    base62: /^[A-Za-z0-9]+$/.test(v),
+    看起来像JWT: v.split('.').length === 3,
+  };
+  const marks = Object.entries(charset)
+    .filter(([, yes]) => yes)
+    .map(([k]) => k)
+    .join(', ');
+  return `前6=${head}… 后4=…${tail}  特征: ${marks || '(无特殊字符)'}`;
 }
 
 async function probe(label, url, headers) {
   let status = 0;
-  let out = '';
+  let body = '';
   try {
     const res = await fetch(url, { headers });
     status = res.status;
     const text = await res.text();
-    let parsed = null;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      /* 非 JSON */
-    }
-    if (parsed && Array.isArray(parsed.errors) && parsed.errors.length) {
-      out = parsed.errors.map((e) => `${e.code}:${e.message}`).join(' | ');
-    } else if (parsed && parsed.success === true) {
-      const r = parsed.result;
-      if (Array.isArray(r)) {
-        out = `成功，返回 ${r.length} 项: ` + r.map((x) => x.name || x.id).join(', ');
-      } else {
-        out = '成功: ' + JSON.stringify(r).slice(0, 200);
-      }
+    let j = null;
+    try { j = JSON.parse(text); } catch {}
+    if (j && Array.isArray(j.errors) && j.errors.length) {
+      body = j.errors.map((e) => `[${e.code}] ${e.message}`).join(' || ');
+    } else if (j && j.success === true) {
+      const r = j.result;
+      if (Array.isArray(r)) body = `成功，${r.length} 项` + (r.length ? ' → ' + r.slice(0, 5).map((x) => x.name || x.id).join(', ') : '');
+      else body = '成功 → ' + JSON.stringify(r).slice(0, 300);
     } else {
-      out = text.slice(0, 300).replace(/\s+/g, ' ');
+      body = text.slice(0, 300).replace(/\s+/g, ' ');
     }
   } catch (e) {
-    out = '请求异常: ' + e.message;
+    body = '异常: ' + e.message;
   }
-  console.log(`  [${label}] HTTP ${status} -> ${out}`);
-  return { status, out };
+  console.log(`  ${label}\n      HTTP ${status}  ${body}`);
+  return { status, body };
 }
 
+const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+
 async function main() {
-  console.log('===== Cloudflare 凭据形态诊断 =====');
-  shape('CF_API_TOKEN', token);
-  shape('CF_API_KEY  ', apiKey);
-  shape('CF_EMAIL   ', email);
-  shape('CF_ACCOUNT_ID', accountId);
+  console.log('===== 1. 凭据形态 =====');
+  console.log('CF_API_TOKEN: ' + tokenSignature(token));
+  console.log('CF_ACCOUNT_ID: 长度=' + accountId.length + ' 十六进制=' + /^[0-9a-f]{32}$/i.test(accountId));
+  console.log('');
 
-  console.log('\n===== 认证方式探测 =====');
+  console.log('===== 2. 逐端点探测（Bearer）=====');
+  await probe('GET /user/tokens/verify', `${CF_API}/user/tokens/verify`, auth);
+  await probe('GET /accounts', `${CF_API}/accounts`, auth);
+  await probe('GET /accounts/{id}', `${CF_API}/accounts/${accountId}`, auth);
+  await probe(`GET /accounts/{id}/pages/projects/${project}`, `${CF_API}/accounts/${accountId}/pages/projects/${project}`, auth);
+  await probe(`GET /accounts/{id}/pages/projects (列表)`, `${CF_API}/accounts/${accountId}/pages/projects`, auth);
+  await probe('GET /zones', `${CF_API}/zones`, auth);
 
-  if (token) {
-    await probe('Bearer 原始值', `${CF_API}/accounts`, {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    });
-    if (token !== token.trim()) {
-      await probe('Bearer trim 后', `${CF_API}/accounts`, {
-        Authorization: `Bearer ${token.trim()}`,
-        'Content-Type': 'application/json',
-      });
-    }
-    await probe('Bearer /user/tokens/verify', `${CF_API}/user/tokens/verify`, {
-      Authorization: `Bearer ${token.trim()}`,
-      'Content-Type': 'application/json',
-    });
-  }
-
-  if (email && apiKey) {
-    await probe('X-Auth-Email + X-Auth-Key', `${CF_API}/accounts`, {
-      'X-Auth-Email': email,
-      'X-Auth-Key': apiKey,
-      'Content-Type': 'application/json',
-    });
-  } else {
-    console.log('  [X-Auth 模式] 跳过：CF_EMAIL 或 CF_API_KEY 未配置');
-  }
-
-  console.log('\n===== 结论参考 =====');
-  console.log('  9109 Invalid access token → Bearer 的值不是合法 API Token（常见：填的是 Global API Key，或 secret 带尾部换行）');
-  console.log('  10000 Authentication error → 认证通过但对目标资源无权限，或 account id 与凭据不属于同一账号');
-  console.log('  Global API Key 必须配合邮箱用 X-Auth-Email + X-Auth-Key 发送，不能当 Bearer 用');
-  console.log('\n诊断结束。');
+  console.log('\n===== 3. 结论判定 =====');
+  console.log('  /user/tokens/verify 401/1000  → token 已被 Cloudflare 判定无效（换 token 或改用 Global Key）');
+  console.log('  /user/tokens/verify 200       → token 本身有效，后续 403 是端点权限或账号不匹配');
+  console.log('  /accounts 403/9109            → 缺 Account Settings Read，wrangler 因先查 /accounts 而失败');
+  console.log('  /accounts/{id}/pages/... 成功  → 权限与账号都对，问题只在 wrangler 的调用顺序');
+  console.log('诊断结束。');
 }
 
 main().catch((e) => {
-  console.error('诊断脚本异常:', e.message);
+  console.error('诊断异常:', e.message);
   process.exit(1);
 });
