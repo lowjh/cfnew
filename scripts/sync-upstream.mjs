@@ -71,17 +71,20 @@ async function 读本仓库文件(路径) {
   }
 }
 
-async function 写本仓库文件(路径, 内容, 消息) {
+async function 写本仓库文件(路径, 内容, 消息, 原文件) {
   const base64 = Buffer.from(内容).toString('base64');
+  const body = {
+    message: 消息,
+    content: base64,
+    branch: 分支,
+    committer: { name: 'github-actions[bot]', email: '41898282+github-actions[bot]@users.noreply.github.com' },
+    author: { name: 'github-actions[bot]', email: '41898282+github-actions[bot]@users.noreply.github.com' },
+  };
+  // 更新已存在的文件必须带上当前 blob sha
+  if (原文件) body.sha = 原文件.sha;
   await api(`/repos/${本仓库}/contents/${encodeURIComponent(路径)}`, {
     method: 'PUT',
-    body: JSON.stringify({
-      message: 消息,
-      content: base64,
-      branch: 分支,
-      committer: { name: 'github-actions[bot]', email: '41898282+github-actions[bot]@users.noreply.github.com' },
-      author: { name: 'github-actions[bot]', email: '41898282+github-actions[bot]@users.noreply.github.com' },
-    }),
+    body: JSON.stringify(body),
   });
 }
 
@@ -102,7 +105,7 @@ async function 主流程() {
     console.log(
       `有变化: ${路径} ${本地文件 ? `blob ${本地文件.sha.slice(0, 8)}` : '(不存在)'} -> ${上游文件.sha.slice(0, 8)} (${上游文件.大小} 字节)`
     );
-    待提交.push({ 路径, 内容: 上游文件.内容 });
+    待提交.push({ 路径, 内容: 上游文件.内容, 原文件: 本地文件 });
   }
 
   if (待提交.length === 0) {
@@ -111,7 +114,7 @@ async function 主流程() {
   }
 
   for (const 项 of 待提交) {
-    await 写本仓库文件(项.路径, 项.内容, '同步上游产物');
+    await 写本仓库文件(项.路径, 项.内容, '同步上游产物', 项.原文件);
     console.log(`已提交: ${项.路径}`);
   }
 
