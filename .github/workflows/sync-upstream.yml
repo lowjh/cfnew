@@ -1,0 +1,33 @@
+name: Sync Upstream CFnew
+
+# 上游 byJoey/cfnew 更新 -> 同步产物进本仓库 -> Cloudflare Pages（Git 集成关联本仓库）自动重建部署。
+# 全程只使用 GitHub 自带的 GITHUB_TOKEN，不需要任何 Cloudflare 令牌。
+on:
+  schedule:
+    - cron: '17 */6 * * *'   # 每 6 小时
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-cfnew
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 同步上游产物并提交
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: node scripts/sync-upstream.mjs
